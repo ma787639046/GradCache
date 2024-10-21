@@ -3,6 +3,15 @@
 
 
 # Gradient Cache
+
+> Modified by Guangyuan Ma (Ma787639046@outlook.com)
+> 
+> This is a customized version of GradCache:
+>
+> 1) Support with Huggingface Accelerate. Thus GradCache will work seemlessly with Transformers Trainer, supporting DDP, FSDP, Deepspeed, etc.
+>
+> 2) Support Dict[str, BatchEncoding | Dict] input format, Dict[str, Tensor] output format. Thus GradCache will work with multi-vector retrieval.
+
 Gradient Cache is a simple technique for unlimitedly scaling contrastive learning batch far beyond GPU/TPU memory constraint. This means training that used to take heavy hardware, e.g. 8 V100 GPU, can be done on a single GPU. In addition, Gradient Cache allow users to replace big RAM GPU/TPU with much more cost efficient high FLOP low RAM systems.
 
 This repo holds a generic implementation of Gradient Cache described in our paper [Scaling Deep Contrastive Learning Batch Size under Memory Limited Setup

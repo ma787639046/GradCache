@@ -9,5 +9,9 @@ setup(
     license='Apache-2.0',
     author='Luyu Gao',
     author_email='luyug@cs.cmu.edu',
-    description=''
+    description='',
+    install_requires=[
+        "torch",
+        "accelerate",
+    ]
 )

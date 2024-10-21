@@ -1,4 +1,5 @@
-from typing import List, Union, Callable, Any
+from typing import List, Dict, Tuple, Union, Callable, Any, Optional
+from itertools import chain
 from contextlib import nullcontext
 from itertools import repeat
 from collections import UserDict
@@ -6,9 +7,15 @@ import logging
 
 import torch
 from torch import nn, Tensor
-from torch.cuda.amp import GradScaler, autocast
 
 from grad_cache.context_managers import RandContext
+
+from accelerate import Accelerator
+try:
+    from deepspeed.runtime.engine import DeepSpeedEngine
+    _is_deepspeed_available = True
+except ImportError:
+    _is_deepspeed_available = False
 
 logger = logging.getLogger(__name__)
 
@@ -24,10 +31,10 @@ class GradCache:
             models: List[nn.Module],
             chunk_sizes: Union[int, List[int]],
             loss_fn: Callable[..., Tensor],
-            split_input_fn: Callable[[Any, int], Any] = None,
-            get_rep_fn: Callable[..., Tensor] = None,
-            fp16: bool = False,
-            scaler: GradScaler = None,
+            compute_loss_context_manager,
+            accelerator: Accelerator,
+            split_input_fn: Optional[Callable[[Any, int], Any]] = None,
+            get_rep_fn: Optional[Callable[..., Tensor]] = None
     ):
         """
         Initialize the Gradient Cache class instance.
@@ -53,12 +60,8 @@ class GradCache:
         self.split_input_fn = split_input_fn
         self.get_rep_fn = get_rep_fn
         self.loss_fn = loss_fn
-
-        if fp16:
-            assert scaler is not None, "mixed precision training requires a gradient scaler passed in"
-
-        self.fp16 = fp16
-        self.scaler = scaler
+        self.compute_loss_context_manager = compute_loss_context_manager
+        self.accelerator = accelerator
 
         self._get_input_tensors_strict = False
 
@@ -68,6 +71,40 @@ class GradCache:
         :return: Current step loss.
         """
         return self.cache_step(*args, **kwargs)
+    
+    def _split(self, model_input, chunk_size: int) -> List:
+        """
+        Default split input into chunks.
+        """
+        # nested dict
+        if isinstance(model_input, (dict, UserDict)) and all(isinstance(x, (dict, UserDict)) for x in model_input.values()):
+            keys = list(model_input.keys())
+            chunked_values: List[List[Dict[str, any]]] = [self.split_inputs(model_input[k], chunk_size=chunk_size) for k in keys]
+            return [dict(zip(kk, tt)) for kk, tt in zip(repeat(keys), zip(*chunked_values))]
+
+        # dict[str, Tensor]
+        if isinstance(model_input, (dict, UserDict)) and all(isinstance(x, Tensor) for x in model_input.values()):
+            keys = list(model_input.keys())
+            chunked_tensors = [model_input[k].split(chunk_size, dim=0) for k in keys]
+            return [dict(zip(kk, tt)) for kk, tt in zip(repeat(keys), zip(*chunked_tensors))]
+
+        # list[Tensor]
+        elif isinstance(model_input, list) and all(isinstance(x, Tensor) for x in model_input):
+            chunked_x = [t.split(chunk_size, dim=0) for t in model_input]
+            return [list(s) for s in zip(*chunked_x)]
+
+        # Tensor
+        elif isinstance(model_input, Tensor):
+            return list(model_input.split(chunk_size, dim=0))
+
+        # tuple[list | dict]
+        elif isinstance(model_input, tuple) and list(map(type, model_input)) == [list, dict]:
+            args_chunks = self.split_inputs(model_input[0], chunk_size)
+            kwargs_chunks = self.split_inputs(model_input[1], chunk_size)
+            return list(zip(args_chunks, kwargs_chunks))
+
+        else:
+            raise NotImplementedError(f'Model input split not implemented for type {type(model_input)}')
 
     def split_inputs(self, model_input, chunk_size: int) -> List:
         """
@@ -80,26 +117,8 @@ class GradCache:
         # delegate splitting to user provided function
         if self.split_input_fn is not None:
             return self.split_input_fn(model_input, chunk_size)
-
-        if isinstance(model_input, (dict, UserDict)) and all(isinstance(x, Tensor) for x in model_input.values()):
-            keys = list(model_input.keys())
-            chunked_tensors = [model_input[k].split(chunk_size, dim=0) for k in keys]
-            return [dict(zip(kk, tt)) for kk, tt in zip(repeat(keys), zip(*chunked_tensors))]
-
-        elif isinstance(model_input, list) and all(isinstance(x, Tensor) for x in model_input):
-            chunked_x = [t.split(chunk_size, dim=0) for t in model_input]
-            return [list(s) for s in zip(*chunked_x)]
-
-        elif isinstance(model_input, Tensor):
-            return list(model_input.split(chunk_size, dim=0))
-
-        elif isinstance(model_input, tuple) and list(map(type, model_input)) == [list, dict]:
-            args_chunks = self.split_inputs(model_input[0], chunk_size)
-            kwargs_chunks = self.split_inputs(model_input[1], chunk_size)
-            return list(zip(args_chunks, kwargs_chunks))
-
-        else:
-            raise NotImplementedError(f'Model input split not implemented for type {type(model_input)}')
+        
+        return self._split(model_input, chunk_size=chunk_size)
 
     def get_input_tensors(self, model_input) -> List[Tensor]:
         """
@@ -131,7 +150,7 @@ class GradCache:
         :param model_input: input to the model call
         :return: model output
         """
-        with autocast() if self.fp16 else nullcontext():
+        with self.compute_loss_context_manager():
             if isinstance(model_input, Tensor):
                 return model(model_input)
             elif isinstance(model_input, list):
@@ -170,7 +189,7 @@ class GradCache:
             self,
             model: nn.Module,
             model_inputs,
-    ) -> [Tensor, List[RandContext]]:
+    ) -> Tuple[Tensor, List[RandContext]]:
         """
         The first forward pass without gradient computation.
         :param model: Encoder model.
@@ -187,26 +206,44 @@ class GradCache:
                 model_reps.append(self.get_reps(y))
 
         # concatenate all sub-batch representations
-        model_reps = torch.cat(model_reps, dim=0)
+        if isinstance(model_reps[0], Tensor):
+            model_reps = torch.cat(model_reps, dim=0)
+        elif isinstance(model_reps[0], dict):
+            keys = set(sum([list(_rep.keys()) for _rep in model_reps], []))
+            model_reps = {k: torch.cat([_rep[k] for _rep in model_reps], dim=0) for k in keys}
+        else:
+            raise TypeError()
         return model_reps, rnd_states
 
-    def build_cache(self, *reps: Tensor, **loss_kwargs) -> [List[Tensor], Tensor]:
+    def build_cache(self, *reps: Tensor | Dict[str, Tensor], **loss_kwargs) -> Tuple[List[Tensor], Tensor]:
         """
         Compute the gradient cache
         :param reps: Computed representations from all encoder models
         :param loss_kwargs: Extra keyword arguments to the loss function
         :return: A tuple of a) gradient cache for each encoder model, and b) loss tensor
         """
-        reps = [r.detach().requires_grad_() for r in reps]
-        with autocast() if self.fp16 else nullcontext():
-            loss = self.compute_loss(*reps, **loss_kwargs)
+        reps_detached = []
+        for r in reps:
+            if isinstance(r, Tensor):
+                reps_detached.append(r.detach().requires_grad_())
+            elif isinstance(r, dict):
+                reps_detached.append({k: v.detach().requires_grad_() for k, v in r.items()})
+            else:
+                raise TypeError()
 
-        if self.fp16:
-            self.scaler.scale(loss).backward()
-        else:
-            loss.backward()
+        with self.compute_loss_context_manager():
+            loss = self.compute_loss(*reps_detached, **loss_kwargs)
 
-        cache = [r.grad for r in reps]
+        self.backward_handler(loss, is_last_micro_step=False)
+
+        cache = []
+        for r in reps_detached:
+            if isinstance(r, Tensor):
+                cache.append(r.grad)
+            elif isinstance(r, dict):
+                cache.append({k: v.grad for k, v in r.items()})
+            else:
+                raise TypeError()
 
         return cache, loss.detach()
 
@@ -216,7 +253,8 @@ class GradCache:
             model_inputs,
             cached_gradients: List[Tensor],
             random_states: List[RandContext],
-            no_sync_except_last: bool = False
+            deepspeed_step_triger: bool, # Set to True if you want to perform DeepSpeedEngine.step the last step
+            no_sync_except_last: bool = False,
     ):
         """
         Run the second forward and the backward pass to compute gradient for a model.
@@ -226,20 +264,62 @@ class GradCache:
         :param random_states: Each input's device random state during the first forward.
         :param no_sync_except_last: If True, under distributed setup, only trigger gradient reduction across processes
         for the last sub-batch's forward-backward pass.
+        :param deepspeed_step_triger: Set to True if you want to perform DeepSpeedEngine.step the last step
         """
         if no_sync_except_last:
+            # Only available for DDP/FSDP
             sync_contexts = [model.no_sync for _ in range(len(model_inputs) - 1)] + [nullcontext]
         else:
             sync_contexts = [nullcontext for _ in range(len(model_inputs))]
+        
+        # Deepspeed Support
+        if deepspeed_step_triger:
+            is_last_micro_steps = [False for _ in range(len(model_inputs) - 1)] + [True]
+        else:
+            is_last_micro_steps = [False for _ in range(len(model_inputs))]
 
-        for x, state, gradient, sync_context in zip(model_inputs, random_states, cached_gradients, sync_contexts):
+        for x, state, gradient, sync_context, is_last_micro_step in zip(model_inputs, random_states, cached_gradients, sync_contexts, is_last_micro_steps):
             with sync_context():
                 with state:
                     y = self.model_call(model, x)
+                
                 reps = self.get_reps(y)
 
-                surrogate = torch.dot(reps.flatten(), gradient.flatten())
-                surrogate.backward()
+                if isinstance(reps, dict):
+                    # Apply flatten & dot on every values
+                    keys = set(chain(reps.keys(), gradient.keys()))
+                    surrogate = sum([torch.dot(reps[k].flatten(), gradient[k].flatten()) for k in keys])
+                elif isinstance(reps, Tensor) and isinstance(gradient, Tensor):
+                    surrogate = torch.dot(reps.flatten(), gradient.flatten())
+                else:
+                    raise TypeError(f"The type of reps is {type(reps)}, gradient is {type(gradient)}")
+                
+                self.backward_handler(surrogate, is_last_micro_step=is_last_micro_step)
+                
+
+    def backward_handler(self, loss: Tensor, is_last_micro_step: bool):
+        """
+        Warp the Backward function.
+        Args:
+            loss: loss for backwards
+            is_last_step: Whether this is the last step, this indicator is used for Deepspeed.
+        """
+        if (hasattr(self.accelerator, 'deepspeed_engine_wrapped')) and \
+            (self.accelerator.deepspeed_engine_wrapped is not None) and \
+            (not is_last_micro_step):
+            # Deepspeed handles micro-batch backward on its own, we need to disable grad accu manually except the last step
+            ds_engine: DeepSpeedEngine = self.accelerator.deepspeed_engine_wrapped.engine
+
+            original_is_gradient_accumulation_boundary = ds_engine._is_gradient_accumulation_boundary
+            ds_engine.set_gradient_accumulation_boundary(False)
+            ds_engine.backward(loss)
+            ds_engine.set_gradient_accumulation_boundary(original_is_gradient_accumulation_boundary)
+
+            # # debug
+            # print(f"ds_engine.micro_steps = {ds_engine.micro_steps}")
+            # print(f"ds_engine.global_steps = {ds_engine.global_steps}")
+        else:
+            self.accelerator.backward(loss)
 
     def cache_step(
             self,
@@ -258,11 +338,6 @@ class GradCache:
         all_reps = []
         all_rnd_states = []
 
-        if no_sync_except_last:
-            assert all(map(lambda m: isinstance(m, nn.parallel.DistributedDataParallel), self.models)), \
-                'Some of models are not wrapped in DistributedDataParallel. Make sure you are running DDP with ' \
-                'proper initializations.'
-
         model_inputs = [self.split_inputs(x, chunk_size) for x, chunk_size in zip(model_inputs, self.chunk_sizes)]
 
         for model, x in zip(self.models, model_inputs):
@@ -271,10 +346,11 @@ class GradCache:
             all_rnd_states.append(rnd_states)
 
         cache, loss = self.build_cache(*all_reps, **loss_kwargs)
-        cache = [c.split(chunk_size) for c, chunk_size in zip(cache, self.chunk_sizes)]
+        cache = [self._split(x, chunk_size) for x, chunk_size in zip(cache, self.chunk_sizes)]
 
-        for model, x, model_cache, rnd_states in zip(
-                self.models, model_inputs, cache, all_rnd_states):
-            self.forward_backward(model, x, model_cache, rnd_states, no_sync_except_last=no_sync_except_last)
+        deepspeed_step_trigers: List[bool] = [False for _ in range(len(self.models) - 1)] + [True]
+        for model, x, model_cache, rnd_states, deepspeed_step_triger in zip(
+                self.models, model_inputs, cache, all_rnd_states, deepspeed_step_trigers):
+            self.forward_backward(model, x, model_cache, rnd_states, deepspeed_step_triger=deepspeed_step_triger, no_sync_except_last=no_sync_except_last)
 
         return loss
